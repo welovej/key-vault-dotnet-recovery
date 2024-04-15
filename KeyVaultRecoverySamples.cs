@@ -1,8 +1,17 @@
-﻿using Microsoft.Azure.Management.KeyVault.Fluent;
-using Microsoft.Azure.Management.KeyVault.Fluent.Models;
-using Microsoft.Azure.Management.ResourceManager.Fluent;
+﻿using Azure;
+using Azure.Core;
+using Azure.Identity;
+using Azure.ResourceManager;
+using Azure.ResourceManager.KeyVault;
+using Azure.ResourceManager.KeyVault.Models;
+using Azure.ResourceManager.Resources;
+using Newtonsoft.Json.Linq;
 using System;
+using System.Configuration;
 using System.Net;
+using System.Net.Http;
+using System.Reflection.Metadata;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -12,7 +21,7 @@ namespace AzureKeyVaultRecoverySamples
     /// Contains samples illustrating enabling recoverable deletion for Azure key vaults,
     /// as well as exercising the recovery and purge functionality, respectively.
     /// </summary>
-    public sealed class KeyVaultRecoverySamples : KeyVaultSampleBase
+    public sealed class KeyVaultRecoverySamples
     {
         /// <summary>
         /// Builds a vault recovery sample object with the specified parameters.
@@ -26,16 +35,39 @@ namespace AzureKeyVaultRecoverySamples
         /// <param name="vaultLocation">Location of the vault.</param>
         /// <param name="vaultName">Vault name.</param>
         public KeyVaultRecoverySamples(string tenantId, string objectId, string appId, string appCredX5T, string subscriptionId, string resourceGroupName, string vaultLocation, string vaultName)
-            : base(tenantId, objectId, appId, appCredX5T, subscriptionId, resourceGroupName, vaultLocation, vaultName)
         { }
 
         /// <summary>
         /// Builds a vault recovery sample object from configuration.
         /// </summary>
         public KeyVaultRecoverySamples()
-            : base()
         { }
+        // retrieve parameters from configuration
+        static string rgName = ConfigurationManager.AppSettings[SampleConstants.ConfigKeys.ResourceGroupName];
+        static string vaultName = ConfigurationManager.AppSettings[SampleConstants.ConfigKeys.VaultName];
 
+        /// <summary>
+        /// Verifies the specified exception is a CloudException, and its status code matches the expected value.
+        /// </summary>
+        /// <param name="e"></param>
+        /// <param name="expectedStatusCode"></param>
+        protected static void VerifyExpectedARMException(Exception e, HttpStatusCode expectedStatusCode)
+        {
+            // verify that the exception is a CloudError one
+            var armException = e as Azure.RequestFailedException;
+            if (armException == null)
+            {
+                Console.WriteLine("Unexpected exception encountered running sample: {0}", e.Message);
+                throw e;
+            }
+
+            // verify that the exception has the expected status code
+            if (armException.Status != (int)expectedStatusCode)
+            {
+                Console.WriteLine("Encountered unexpected ARM exception; expected status code: {0}, actual: {1}", armException.Status, expectedStatusCode);
+                throw e;
+            }
+        }
         #region samples
         /// <summary>
         /// Demonstrates how to enable soft delete on an existing vault, and then proceeds to delete, recover and purge the vault.
@@ -44,24 +76,23 @@ namespace AzureKeyVaultRecoverySamples
         /// <returns>Task representing this functionality.</returns>
         public static async Task DemonstrateRecoveryAndPurgeForNewVaultAsync()
         {
-            // instantiate the samples object
-            var sample = new KeyVaultRecoverySamples();
-
-            var rgName = sample.context.ResourceGroupName;
-
-            // derive a unique vault name for this sample
-            var vaultName = sample.context.VaultName + "new";
-
-            DeletedVaultInner deletedVault = null;
-
+            var cred = new DefaultAzureCredential();
+            var client = new ArmClient(cred);
+            var sub = (await client.GetDefaultSubscriptionAsync());
+            var location = AzureLocation.EastUS;
+            var rg = (await sub.GetResourceGroups().CreateOrUpdateAsync(WaitUntil.Completed, rgName, new ResourceGroupData(location))).Value;
             try
             {
-                var vaultParameters = sample.CreateVaultParameters(rgName, vaultName, sample.context.PreferredLocation, enableSoftDelete: true, enablePurgeProtection: false);
-                Console.WriteLine("Operating with vault name '{0}' in resource group '{1}' and location '{2}'", vaultName, rgName, vaultParameters.Location);
+                var keyVaultSku = new KeyVaultSku(KeyVaultSkuFamily.A, KeyVaultSkuName.Standard);
+                var keyVaultProperties = new KeyVaultProperties(Guid.NewGuid(), keyVaultSku) { EnableSoftDelete = true };
+
+                var content = new KeyVaultCreateOrUpdateContent(AzureLocation.EastUS, keyVaultProperties);
+
+                Console.WriteLine("Operating with vault name '{0}' in resource group '{1}' and location '{2}'", vaultName, rgName, content.Location);
 
                 // create new soft-delete-enabled vault
                 Console.Write("Creating vault...");
-                var vault = await sample.ManagementClient.Vaults.CreateOrUpdateAsync(rgName, vaultName, vaultParameters).ConfigureAwait(false);
+                var keyVaultResource = (await rg.GetKeyVaults().CreateOrUpdateAsync(WaitUntil.Completed, vaultName, content)).Value;
                 Console.WriteLine("done.");
 
                 // wait for the DNS record to propagate; verify properties
@@ -70,39 +101,44 @@ namespace AzureKeyVaultRecoverySamples
                 Console.WriteLine("done.");
 
                 Console.Write("Retrieving newly created vault...");
-                var retrievedVault = await sample.ManagementClient.Vaults.GetAsync(rgName, vaultName).ConfigureAwait(false);
+                var retrievedVault = (await rg.GetKeyVaultAsync(vaultName)).Value;
                 Console.WriteLine("done.");
 
                 // delete vault
                 Console.Write("Deleting vault...");
-                await sample.ManagementClient.Vaults.DeleteAsync(rgName, vaultName).ConfigureAwait(false);
+                await retrievedVault.DeleteAsync(WaitUntil.Completed);
                 Console.WriteLine("done.");
 
                 // confirm the existence of the deleted vault
                 Console.Write("Retrieving deleted vault...");
-                deletedVault = await sample.ManagementClient.Vaults.GetDeletedAsync(vaultName, retrievedVault.Location).ConfigureAwait(false);
-                Console.WriteLine("done; '{0}' deleted on: {1}, scheduled for purge on: {2}", deletedVault.Id, deletedVault.Properties.DeletionDate, deletedVault.Properties.ScheduledPurgeDate);
+                ResourceIdentifier rid = DeletedKeyVaultResource.CreateResourceIdentifier(sub.Data.SubscriptionId, location, vaultName);
+                DeletedKeyVaultResource deletedRes = await client.GetDeletedKeyVaultResource(rid).GetAsync();
+                Console.WriteLine("done; '{0}' deleted on: {1}, scheduled for purge on: {2}", deletedRes.Data.Id, deletedRes.Data.Properties.DeletedOn, deletedRes.Data.Properties.ScheduledPurgeOn);
 
                 // recover; set the creation mode as 'recovery' in the vault parameters
                 Console.Write("Recovering deleted vault...");
-                vaultParameters.Properties.CreateMode = CreateMode.Recover;
-                await sample.ManagementClient.Vaults.CreateOrUpdateAsync(rgName, vaultName, vaultParameters).ConfigureAwait(false);
+                var keyVaultSku_recover = new KeyVaultSku(KeyVaultSkuFamily.A, KeyVaultSkuName.Standard);
+                var keyVaultProperties_recover = new KeyVaultProperties(Guid.NewGuid(), keyVaultSku) { CreateMode = KeyVaultCreateMode.Recover };
+                var content_recover = new KeyVaultCreateOrUpdateContent(AzureLocation.EastUS, keyVaultProperties_recover);
+                await rg.GetKeyVaults().CreateOrUpdateAsync(WaitUntil.Completed, vaultName, content_recover);
                 Console.WriteLine("done.");
 
                 // confirm recovery
                 Console.Write("Verifying the existence of recovered vault...");
-                var recoveredVault = await sample.ManagementClient.Vaults.GetAsync(rgName, vaultName).ConfigureAwait(false);
+                var recoveredVault_identifier = KeyVaultResource.CreateResourceIdentifier(sub.Data.SubscriptionId, rgName, vaultName);
+                await client.GetKeyVaultResource(recoveredVault_identifier).GetAsync();
                 Console.WriteLine("done.");
 
                 // delete vault
                 Console.Write("Deleting vault...");
-                await sample.ManagementClient.Vaults.DeleteAsync(rgName, vaultName).ConfigureAwait(false);
+                await retrievedVault.DeleteAsync(WaitUntil.Completed);
                 Console.WriteLine("done.");
 
                 // purge vault
                 Console.Write("Purging vault...");
-                deletedVault = await sample.ManagementClient.Vaults.GetDeletedAsync(vaultName, recoveredVault.Location).ConfigureAwait(false);
-                await sample.ManagementClient.Vaults.PurgeDeletedAsync(vaultName, recoveredVault.Location).ConfigureAwait(false);
+                ResourceIdentifier rid_purge = DeletedKeyVaultResource.CreateResourceIdentifier(sub.Data.SubscriptionId, location, vaultName);
+                DeletedKeyVaultResource deletedRes_purge = await client.GetDeletedKeyVaultResource(rid_purge).GetAsync();
+                await deletedRes_purge.PurgeDeletedAsync(WaitUntil.Completed);
                 Console.WriteLine("done.");
             }
             catch (Exception e)
@@ -115,7 +151,9 @@ namespace AzureKeyVaultRecoverySamples
             try
             {
                 Console.Write("Verifying vault deletion succeeded...");
-                await sample.ManagementClient.Vaults.GetAsync(rgName, vaultName);
+                var recoveredVault_identifier = KeyVaultResource.CreateResourceIdentifier(sub.Data.SubscriptionId, rgName, vaultName);
+                var keyValt = (await client.GetKeyVaultResource(recoveredVault_identifier).GetAsync()).Value;
+                var data = keyValt.Data;
             }
             catch (Exception e)
             {
@@ -127,7 +165,10 @@ namespace AzureKeyVaultRecoverySamples
             try
             {
                 Console.Write("Verifying vault purging succeeded...");
-                await sample.ManagementClient.Vaults.GetDeletedAsync(vaultName, deletedVault.Properties.Location).ConfigureAwait(false);
+                ResourceIdentifier rid = DeletedKeyVaultResource.CreateResourceIdentifier(sub.Data.SubscriptionId, location, vaultName);
+                DeletedKeyVaultResource deletedRes = await client.GetDeletedKeyVaultResource(rid).GetAsync();
+                var data = deletedRes.Data;
+
             }
             catch (Exception e)
             {
@@ -144,24 +185,22 @@ namespace AzureKeyVaultRecoverySamples
         /// <returns>Task representing this functionality.</returns>
         public static async Task DemonstrateRecoveryAndPurgeForExistingVaultAsync()
         {
-            // instantiate the samples object
-            var sample = new KeyVaultRecoverySamples();
-
-            var rgName = sample.context.ResourceGroupName;
-
-            // derive a unique vault name for this sample
-            var vaultName = sample.context.VaultName + "existing";
-
-            DeletedVaultInner deletedVault = null;
-
+            var cred = new DefaultAzureCredential();
+            var client = new ArmClient(cred);
+            var sub = (await client.GetDefaultSubscriptionAsync());
+            var location = AzureLocation.EastUS;
+            ResourceGroupResource rg = (await sub.GetResourceGroups().CreateOrUpdateAsync(WaitUntil.Completed, rgName, new ResourceGroupData(location))).Value;
             try
             {
-                var vaultParameters = sample.CreateVaultParameters(rgName, vaultName, sample.context.PreferredLocation, enableSoftDelete: false, enablePurgeProtection: false);
-                Console.WriteLine("Operating with vault name '{0}' in resource group '{1}' and location '{2}'", vaultName, rgName, vaultParameters.Location);
+                var keyVaultSku = new KeyVaultSku(KeyVaultSkuFamily.A, KeyVaultSkuName.Standard);
+                var keyVaultProperties = new KeyVaultProperties(Guid.NewGuid(), keyVaultSku) { EnableSoftDelete = false };
+                var content = new KeyVaultCreateOrUpdateContent(AzureLocation.EastUS, keyVaultProperties);
+
+                Console.WriteLine("Operating with vault name '{0}' in resource group '{1}' and location '{2}'", vaultName, rgName, content.Location);
 
                 // create new vault, not enabled for soft delete
                 Console.Write("Creating vault...");
-                var vault = await sample.ManagementClient.Vaults.CreateOrUpdateAsync(rgName, vaultName, vaultParameters).ConfigureAwait(false);
+                var keyVaultResource = (await rg.GetKeyVaults().CreateOrUpdateAsync(WaitUntil.Completed, vaultName, content)).Value;
                 Console.WriteLine("done.");
 
                 // wait for the DNS record to propagate; verify properties
@@ -170,44 +209,48 @@ namespace AzureKeyVaultRecoverySamples
                 Console.WriteLine("done.");
 
                 Console.Write("Retrieving newly created vault...");
-                var retrievedVault = await sample.ManagementClient.Vaults.GetAsync(rgName, vaultName).ConfigureAwait(false);
+                var retrievedVault = (await rg.GetKeyVaultAsync(vaultName)).Value;
                 Console.WriteLine("done.");
 
                 // enable soft delete on existing vault
                 Console.Write("Enabling soft delete on existing vault...");
-                await sample.EnableRecoveryOptionsOnExistingVaultAsync(rgName, vaultName, enablePurgeProtection: false).ConfigureAwait(false);
+                retrievedVault.Data.Properties.EnableSoftDelete = true;
                 Console.WriteLine("done.");
 
                 // delete vault
                 Console.Write("Deleting vault...");
-                await sample.ManagementClient.Vaults.DeleteAsync(rgName, vaultName).ConfigureAwait(false);
+                await retrievedVault.DeleteAsync(WaitUntil.Completed);
                 Console.WriteLine("done.");
 
                 // confirm the existence of the deleted vault
                 Console.Write("Retrieving deleted vault...");
-                deletedVault = await sample.ManagementClient.Vaults.GetDeletedAsync(vaultName, retrievedVault.Location).ConfigureAwait(false);
-                Console.WriteLine("done; '{0}' deleted on: {1}, scheduled for purge on: {2}", deletedVault.Id, deletedVault.Properties.DeletionDate, deletedVault.Properties.ScheduledPurgeDate);
+                ResourceIdentifier rid = DeletedKeyVaultResource.CreateResourceIdentifier(sub.Data.SubscriptionId, location, vaultName);
+                DeletedKeyVaultResource deletedRes = await client.GetDeletedKeyVaultResource(rid).GetAsync();
+                Console.WriteLine("done; '{0}' deleted on: {1}, scheduled for purge on: {2}", deletedRes.Data.Id, deletedRes.Data.Properties.DeletedOn, deletedRes.Data.Properties.ScheduledPurgeOn);
 
                 // recover; set the creation mode as 'recovery' in the vault parameters
                 Console.Write("Recovering deleted vault...");
-                vaultParameters.Properties.CreateMode = CreateMode.Recover;
-                await sample.ManagementClient.Vaults.CreateOrUpdateAsync(rgName, vaultName, vaultParameters).ConfigureAwait(false);
+                var keyVaultSku_recover = new KeyVaultSku(KeyVaultSkuFamily.A, KeyVaultSkuName.Standard);
+                var keyVaultProperties_recover = new KeyVaultProperties(Guid.NewGuid(), keyVaultSku) { CreateMode = KeyVaultCreateMode.Recover };
+                var content_recover = new KeyVaultCreateOrUpdateContent(AzureLocation.EastUS, keyVaultProperties_recover);
+                await rg.GetKeyVaults().CreateOrUpdateAsync(WaitUntil.Completed, vaultName, content_recover);
                 Console.WriteLine("done.");
 
                 // confirm recovery
                 Console.Write("Verifying the existence of recovered vault...");
-                var recoveredVault = await sample.ManagementClient.Vaults.GetAsync(rgName, vaultName).ConfigureAwait(false);
+                var recoveredVault_identifier = KeyVaultResource.CreateResourceIdentifier(sub.Data.SubscriptionId, rgName, vaultName);
+                await client.GetKeyVaultResource(recoveredVault_identifier).GetAsync();
                 Console.WriteLine("done.");
 
                 // delete vault
                 Console.Write("Deleting vault...");
-                await sample.ManagementClient.Vaults.DeleteAsync(rgName, vaultName).ConfigureAwait(false);
+                await retrievedVault.DeleteAsync(WaitUntil.Completed);
                 Console.WriteLine("done.");
 
-                // purge vault
                 Console.Write("Purging vault...");
-                deletedVault = await sample.ManagementClient.Vaults.GetDeletedAsync(vaultName, recoveredVault.Location).ConfigureAwait(false);
-                await sample.ManagementClient.Vaults.PurgeDeletedAsync(vaultName, recoveredVault.Location).ConfigureAwait(false);
+                ResourceIdentifier rid_purge = DeletedKeyVaultResource.CreateResourceIdentifier(sub.Data.SubscriptionId, location, vaultName);
+                DeletedKeyVaultResource deletedRes_purge = (await client.GetDeletedKeyVaultResource(rid_purge).GetAsync()).Value;
+                await deletedRes_purge.PurgeDeletedAsync(WaitUntil.Completed);
                 Console.WriteLine("done.");
             }
             catch (Exception e)
@@ -220,7 +263,9 @@ namespace AzureKeyVaultRecoverySamples
             try
             {
                 Console.Write("Verifying vault deletion succeeded...");
-                await sample.ManagementClient.Vaults.GetAsync(rgName, vaultName);
+                var recoveredVault_identifier = KeyVaultResource.CreateResourceIdentifier(sub.Data.SubscriptionId, rgName, vaultName);
+                var keyValt = (await client.GetKeyVaultResource(recoveredVault_identifier).GetAsync()).Value;
+                var data = keyValt.Data;
             }
             catch (Exception e)
             {
@@ -232,7 +277,9 @@ namespace AzureKeyVaultRecoverySamples
             try
             {
                 Console.Write("Verifying vault purging succeeded...");
-                await sample.ManagementClient.Vaults.GetDeletedAsync(vaultName, deletedVault.Properties.Location).ConfigureAwait(false);
+                ResourceIdentifier rid = DeletedKeyVaultResource.CreateResourceIdentifier(sub.Data.SubscriptionId, location, vaultName);
+                DeletedKeyVaultResource deletedRes = (await client.GetDeletedKeyVaultResource(rid).GetAsync()).Value;
+                var data = deletedRes.Data;
             }
             catch (Exception e)
             {
