@@ -117,7 +117,6 @@ namespace AzureKeyVaultRecoverySamples
 
                 // recover; set the creation mode as 'recovery' in the vault parameters
                 Console.Write("Recovering deleted vault...");
-                var keyVaultSku_recover = new KeyVaultSku(KeyVaultSkuFamily.A, KeyVaultSkuName.Standard);
                 var keyVaultProperties_recover = new KeyVaultProperties(Guid.NewGuid(), keyVaultSku) { CreateMode = KeyVaultCreateMode.Recover };
                 var content_recover = new KeyVaultCreateOrUpdateContent(AzureLocation.EastUS, keyVaultProperties_recover);
                 await rg.GetKeyVaults().CreateOrUpdateAsync(WaitUntil.Completed, vaultName, content_recover);
@@ -230,7 +229,6 @@ namespace AzureKeyVaultRecoverySamples
 
                 // recover; set the creation mode as 'recovery' in the vault parameters
                 Console.Write("Recovering deleted vault...");
-                var keyVaultSku_recover = new KeyVaultSku(KeyVaultSkuFamily.A, KeyVaultSkuName.Standard);
                 var keyVaultProperties_recover = new KeyVaultProperties(Guid.NewGuid(), keyVaultSku) { CreateMode = KeyVaultCreateMode.Recover };
                 var content_recover = new KeyVaultCreateOrUpdateContent(AzureLocation.EastUS, keyVaultProperties_recover);
                 await rg.GetKeyVaults().CreateOrUpdateAsync(WaitUntil.Completed, vaultName, content_recover);
